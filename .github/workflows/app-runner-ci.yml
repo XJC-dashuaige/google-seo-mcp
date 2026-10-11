@@ -5,6 +5,7 @@ on:
     paths:
       - "apprunner.yaml"
       - "src/**"
+      - "test/app-runner-readonly-expansion.mjs"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/app-runner-ci.yml"
@@ -31,3 +32,5 @@ jobs:
         run: npm run build
       - name: Verify compiled MCP entrypoint
         run: test -f dist/index.js
+      - name: Verify expanded read-only toolset (offline)
+        run: node test/app-runner-readonly-expansion.mjs
