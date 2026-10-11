@@ -10,6 +10,11 @@ const mode = process.argv.includes("--http") || process.env.MCP_TRANSPORT === "h
 if (mode === "http") {
   const { startHttp } = await import("./http.js");
   startHttp();
+  if (process.env.SEO_MCP_STAGING_DIAGNOSTIC === "1") {
+    void import("./staging-google-diagnostic.js")
+      .then(m => m.verifyStagingGoogleAccess())
+      .catch(e => console.error(JSON.stringify({ check: "STAGING_DIAGNOSTIC", ok: false, errorType: (e as Error).name })));
+  }
 } else {
   const server = createServer();
   await server.connect(new StdioServerTransport());
