@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { DynamoOAuthStore } from "./oauth-dynamodb-store.js";
 import { envValue } from "./env.js";
 import { deriveKey, hashToken, signPayload, verifyPayload } from "./hosted/store.js";
 import { esc } from "./hosted/pages.js";
@@ -243,11 +244,11 @@ export class OAuthStore {
 export interface OAuthGrantContext { label: string; readOnly: boolean; scope: string; clientId: string }
 
 export interface OAuthServer {
-  store: OAuthStore;
+  store: OAuthStore | DynamoOAuthStore;
   /** Handle the metadata, registration, authorize, token and revoke routes; false when the path is not ours. */
   handle(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<boolean>;
   /** Resolve a bearer token from /mcp; null when it is not one of ours. */
-  resolve(bearer: string): OAuthGrantContext | null;
+  resolve(bearer: string): Promise<OAuthGrantContext | null>;
   /** URL to advertise in WWW-Authenticate so an unauthenticated client can discover the flow. */
   metadataUrl(req: http.IncomingMessage): string;
   describe(): string;
@@ -266,7 +267,10 @@ export function loadOAuth(): OAuthServer | null {
   const mcpPath = envValue("MCP_PATH") ?? "/mcp";
   const fixedBase = envValue("SEO_MCP_PUBLIC_URL")?.replace(/\/+$/, "");
   const dataDir = envValue("SEO_MCP_DATA_DIR") ?? path.join(os.homedir(), ".config", "google-seo-mcp");
-  const store = new OAuthStore(path.join(dataDir, "oauth.db"));
+  const table = envValue("SEO_MCP_DYNAMODB_TABLE");
+  const store: OAuthStore | DynamoOAuthStore = table
+    ? new DynamoOAuthStore(table, envValue("AWS_REGION") ?? envValue("AWS_DEFAULT_REGION") ?? "us-east-1")
+    : new OAuthStore(path.join(dataDir, "oauth.db"));
   // Approval requests are signed so a POST can only carry parameters from a page we rendered.
   const key = deriveKey(`${envValue("SEO_MCP_HOSTED_SECRET") ?? operatorToken}|oauth-approval`);
   const codes = new Map<string, Pending>();
@@ -346,11 +350,11 @@ export function loadOAuth(): OAuthServer | null {
       if (!uris.length || uris.length > MAX_REDIRECT_URIS) { jsonOut(res, 400, { error: "invalid_redirect_uri", error_description: `redirect_uris must hold 1 to ${MAX_REDIRECT_URIS} entries` }); return true; }
       const bad = uris.filter((u) => !validRedirectUri(u));
       if (bad.length) { jsonOut(res, 400, { error: "invalid_redirect_uri", error_description: `not accepted: ${bad.join(", ")} (https, http on loopback, or a private-use scheme)` }); return true; }
-      store.pruneClients();
+      await store.pruneClients();
       // Registration needs no credentials by design, so keep it from filling the disk.
-      if (store.countClients() >= MAX_CLIENTS) { jsonOut(res, 503, { error: "temporarily_unavailable", error_description: "too many client registrations on this server; try again later" }); return true; }
+      if (await store.countClients() >= MAX_CLIENTS) { jsonOut(res, 503, { error: "temporarily_unavailable", error_description: "too many client registrations on this server; try again later" }); return true; }
       const name = typeof body.client_name === "string" ? body.client_name.slice(0, 80) : null;
-      const c = store.registerClient(name, uris);
+      const c = await store.registerClient(name, uris);
       console.error(JSON.stringify({ oauth: "register", at: new Date().toISOString(), client: c.clientId, name: c.name, redirectUris: uris }));
       jsonOut(res, 201, {
         client_id: c.clientId,
@@ -369,7 +373,7 @@ export function loadOAuth(): OAuthServer | null {
       sweepCodes();
       if (m === "GET") {
         const q = url.searchParams;
-        const client = store.getClient(q.get("client_id") ?? "");
+        const client = await store.getClient(q.get("client_id") ?? "");
         const redirectUri = q.get("redirect_uri") ?? "";
         // An unverifiable client or redirect target must not be redirected to; show the error here instead.
         if (!client) { htmlOut(res, 400, errorPage("Unknown client", "This client_id is not registered on this server. Remove the connector and add it again so it can register.")); return true; }
@@ -389,7 +393,7 @@ export function loadOAuth(): OAuthServer | null {
         const form = new URLSearchParams(raw);
         const blob = verifyPayload<{ c: string; r: string; s: string; ch: string; sc: string }>(form.get("approval") ?? undefined, key);
         if (!blob) { htmlOut(res, 400, errorPage("This page expired", "Approval pages are valid for ten minutes. Start the connection again from your client.")); return true; }
-        const client = store.getClient(blob.c);
+        const client = await store.getClient(blob.c);
         if (!client || !client.redirectUris.includes(blob.r)) { htmlOut(res, 400, errorPage("Unknown client", "The client was removed while this page was open. Add the connector again.")); return true; }
         const ip = ipOf(req);
         if (throttled(ip)) { htmlOut(res, 429, errorPage("Too many attempts", "Ten wrong tokens from this address. Wait fifteen minutes and try again.")); return true; }
@@ -402,7 +406,9 @@ export function loadOAuth(): OAuthServer | null {
         }
         const scope = form.get("readonly") ? SCOPE_READ : blob.sc;
         const code = newSecret(CODE_PREFIX);
-        codes.set(hashToken(code), { clientId: blob.c, redirectUri: blob.r, challenge: blob.ch, scope, exp: Date.now() + CODE_TTL_MS });
+        const pending: Pending = { clientId: blob.c, redirectUri: blob.r, challenge: blob.ch, scope, exp: Date.now() + CODE_TTL_MS };
+        if (store instanceof DynamoOAuthStore) await store.saveCode(hashToken(code), pending);
+        else codes.set(hashToken(code), pending);
         console.error(JSON.stringify({ oauth: "approved", at: new Date().toISOString(), client: blob.c, name: client.name, scope }));
         bounce(res, blob.r, { code, state: blob.s });
         return true;
@@ -420,20 +426,22 @@ export function loadOAuth(): OAuthServer | null {
       const clientId = form.get("client_id");
       if (grantType === "authorization_code") {
         const hash = hashToken(form.get("code") ?? "");
-        const pending = codes.get(hash);
-        codes.delete(hash);   // single use, whatever happens next
+        const pending = store instanceof DynamoOAuthStore
+          ? await store.consumeCode(hash)
+          : codes.get(hash);
+        if (!(store instanceof DynamoOAuthStore)) codes.delete(hash);   // single use
         if (!pending || pending.exp < Date.now()) { jsonOut(res, 400, { error: "invalid_grant", error_description: "unknown or expired code" }); return true; }
         if (clientId && clientId !== pending.clientId) { jsonOut(res, 400, { error: "invalid_grant", error_description: "code was issued to another client" }); return true; }
         const redirectUri = form.get("redirect_uri");
         if (redirectUri && redirectUri !== pending.redirectUri) { jsonOut(res, 400, { error: "invalid_grant", error_description: "redirect_uri does not match the authorization request" }); return true; }
         if (!verifyPkce(form.get("code_verifier") ?? "", pending.challenge, "S256")) { jsonOut(res, 400, { error: "invalid_grant", error_description: "code_verifier does not match code_challenge" }); return true; }
-        const issued = store.issue(pending.clientId, pending.scope);
+        const issued = await store.issue(pending.clientId, pending.scope);
         console.error(JSON.stringify({ oauth: "issued", at: new Date().toISOString(), client: pending.clientId, grant: issued.grantId, scope: issued.scope }));
         jsonOut(res, 200, { access_token: issued.access, token_type: "Bearer", expires_in: issued.expiresIn, refresh_token: issued.refresh, scope: issued.scope });
         return true;
       }
       if (grantType === "refresh_token") {
-        const issued = store.rotate(form.get("refresh_token") ?? "", clientId);
+        const issued = await store.rotate(form.get("refresh_token") ?? "", clientId);
         if (!issued) { jsonOut(res, 400, { error: "invalid_grant", error_description: "unknown, expired or already-rotated refresh token" }); return true; }
         jsonOut(res, 200, { access_token: issued.access, token_type: "Bearer", expires_in: issued.expiresIn, refresh_token: issued.refresh, scope: issued.scope });
         return true;
@@ -445,7 +453,7 @@ export function loadOAuth(): OAuthServer | null {
     if (p === "/oauth/revoke") {
       if (m !== "POST") { jsonOut(res, 405, { error: "invalid_request" }); return true; }
       const form = await readFormOrJson(req).catch(() => null);
-      const hit = form ? store.revoke(form.get("token") ?? "") : false;
+      const hit = form ? await store.revoke(form.get("token") ?? "") : false;
       if (hit) console.error(JSON.stringify({ oauth: "revoked", at: new Date().toISOString() }));
       jsonOut(res, 200, {});   // RFC 7009: unknown tokens also return 200
       return true;
@@ -457,14 +465,14 @@ export function loadOAuth(): OAuthServer | null {
   LOADED = {
     store,
     handle,
-    resolve(bearer) {
+    async resolve(bearer) {
       if (!bearer.startsWith(ACCESS_PREFIX)) return null;
-      const g = store.resolveAccess(bearer);
+      const g = await store.resolveAccess(bearer);
       if (!g) return null;
       return { label: `oauth client ${g.clientId}`, readOnly: g.scope === SCOPE_READ, scope: g.scope, clientId: g.clientId };
     },
     metadataUrl: (req) => `${baseOf(req)}/.well-known/oauth-protected-resource`,
-    describe: () => `OAuth on (${store.countClients()} clients, ${store.countGrants()} grants, data in ${dataDir})`,
+    describe: () => `OAuth on (backend: ${table ? "DynamoDB" : "local SQLite"})`,
   };
   return LOADED;
 }
