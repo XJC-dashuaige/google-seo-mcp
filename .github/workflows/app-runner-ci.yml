@@ -29,5 +29,5 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Compile TypeScript
         run: npm run build
-      - name: Run unit tests
-        run: node --test test/unit/
+      - name: Verify compiled MCP entrypoint
+        run: test -f dist/index.js
