@@ -46,7 +46,7 @@ export class DynamoOAuthStore {
   }
   async countClients(): Promise<number> { return (await this.api.scan("client#")).length; }
   async countGrants(): Promise<number> {
-    return (await this.api.scan("grant#")).map(x => decode<Grant>(x)).filter(x => x && !x.revokedAt && x.refreshExp > epoch()).length;
+    return (await this.api.scan("grant#")).filter(x => { const g = decode<Grant>(x); return g && !x.revokedAt && g.refreshExp > epoch(); }).length;
   }
   async pruneClients(): Promise<number> {
     const clients = await this.api.scan("client#");
@@ -78,7 +78,7 @@ export class DynamoOAuthStore {
       prevRefreshHash: null, createdAt: stamp(), lastUsedAt: null, calls: 0, revokedAt: null,
     };
     await this.api.transaction([
-      put(this.table, "grant#" + grant.id, grant, grant.refreshExp),
+      { Put: { TableName: this.table, Item: { pk: dynamoString("grant#" + grant.id), body: body(grant), ttl: dynamoNumber(grant.refreshExp), refreshHash: dynamoString(grant.refreshHash) }, ConditionExpression: "attribute_not_exists(pk)" } },
       put(this.table, "access#" + grant.accessHash, { grantId: grant.id }, grant.accessExp),
       put(this.table, "refresh#" + grant.refreshHash, { grantId: grant.id }, grant.refreshExp),
     ]);
@@ -86,7 +86,11 @@ export class DynamoOAuthStore {
   }
   private async lookup(pk: string): Promise<Grant | null> {
     const link = decode<{ grantId: string }>(await this.api.get(pk));
-    return link ? decode<Grant>(await this.api.get("grant#" + link.grantId)) : null;
+    if (!link) return null;
+    const item = await this.api.get("grant#" + link.grantId);
+    const grant = decode<Grant>(item);
+    if (grant && item?.revokedAt) grant.revokedAt = String((item.revokedAt as { S: string }).S);
+    return grant;
   }
   async resolveAccess(token: string) {
     if (!token.startsWith("mcpa_")) return null;
@@ -147,7 +151,7 @@ export class DynamoOAuthStore {
   }
   async listGrants(includeRevoked = false) {
     const grants = (await this.api.scan("grant#"))
-      .map(x => decode<Grant>(x)).filter((x): x is Grant => !!x && (includeRevoked || !x.revokedAt));
+      .map(x => { const g = decode<Grant>(x); if (g && x.revokedAt) g.revokedAt = String((x.revokedAt as { S: string }).S); return g; }).filter((x): x is Grant => !!x && (includeRevoked || !x.revokedAt));
     const list = await Promise.all(grants.map(async g => {
       const client = await this.getClient(g.clientId);
       return {
@@ -160,7 +164,9 @@ export class DynamoOAuthStore {
     return list.sort((a,b) => b.createdAt.localeCompare(a.createdAt));
   }
   async revokeGrant(id: string): Promise<boolean> {
-    const grant = decode<Grant>(await this.api.get("grant#" + id));
+    const item = await this.api.get("grant#" + id);
+    const grant = decode<Grant>(item);
+    if (grant && item?.revokedAt) grant.revokedAt = String((item.revokedAt as { S: string }).S);
     if (!grant || grant.revokedAt) return false;
     // Atomically set a revocation attribute; access lookups check it.
     // The old body remains only to preserve audit/debug metadata.
