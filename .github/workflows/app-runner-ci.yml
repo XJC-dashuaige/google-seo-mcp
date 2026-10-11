@@ -6,6 +6,7 @@ on:
       - "apprunner.yaml"
       - "src/**"
       - "test/app-runner-readonly-expansion.mjs"
+      - "test/oauth-dynamo-unit.mjs"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/app-runner-ci.yml"
@@ -34,3 +35,5 @@ jobs:
         run: test -f dist/index.js
       - name: Verify expanded read-only toolset (offline)
         run: node test/app-runner-readonly-expansion.mjs
+      - name: Verify DynamoDB OAuth durable store (mocked AWS)
+        run: node test/oauth-dynamo-unit.mjs
