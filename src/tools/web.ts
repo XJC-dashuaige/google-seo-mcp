@@ -5,6 +5,7 @@
 import { gunzipSync } from "node:zlib";
 import { envValue } from "../env.js";
 import { assertSafeAuditUrl } from "./audit-url-policy.js";
+import { auditDispatcher } from "./audit-dns.js";
 import { z } from "zod";
 import * as cheerio from "cheerio";
 import { imageSize, disableTypes } from "image-size";
@@ -26,9 +27,9 @@ export async function fetchWithTimeout(url: string, init: RequestInit = {}, time
     for (let hop = 0; hop <= 6; hop++) {
       assertSafeAuditUrl(current);
       const response = await fetch(current, {
-        ...init, redirect: "manual", signal: ctrl.signal,
+        ...init, dispatcher: auditDispatcher, redirect: "manual", signal: ctrl.signal,
         headers: { "User-Agent": UA, Accept: "*/*", ...(init.headers ?? {}) },
-      });
+      } as RequestInit);
       if (redirect !== "follow" || response.status < 300 || response.status >= 400) return response;
       const location = response.headers.get("location");
       if (!location) return response;

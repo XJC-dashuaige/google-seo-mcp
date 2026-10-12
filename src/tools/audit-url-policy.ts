@@ -1,6 +1,6 @@
 /**
  * Reject private/internal targets before page auditing. This is a hostname
- * policy, not DNS pinning; deploy behind egress controls for full SSRF defence.
+ * policy. audit-dns.ts also validates DNS at socket connection time.
  * SEO_MCP_AUDIT_ALLOWED_HOSTS narrows user supplied site fetches in staging.
  */
 import { isIP } from "node:net";

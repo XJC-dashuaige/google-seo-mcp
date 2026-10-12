@@ -31,11 +31,14 @@ Status: **PREPARATION ONLY. DO NOT APPLY TO LIVE APP RUNNER YET.**
 4. Ensure OAuth issuer/public URL matches the existing public endpoint and the ChatGPT registration flow works again after **replacement of the App Runner instance**.
 5. Keep `MCP_AUTH_TOKEN` private. All MCP tools must remain read-only, including when the OAuth approval scope is broader.
 6. Web audit/crawl tools fetch user-supplied URLs. Before widening access, assess SSRF risk and consider allowlisting audited domains (e.g. cjrb.net, artisancutlery.net), URL redirects and DNS rebinding defenses. Never give anonymous access.
+7. Audit HTTP connections now use a dedicated dispatcher whose socket lookup validates the entire DNS answer set and passes those exact addresses to the socket. Private, reserved, mapped and transition addresses fail closed. Each redirect remains subject to the URL policy. Validate the connection on staging; local fake-IP proxies are intentionally rejected.
+8. Review public dynamic client registration before production: the DynamoDB implementation scans the table during pruning and counting on each registration, and the client cap is checked separately from the async insert. Bound request cost and enforce capacity atomically before release.
 
 ## Cost and API gates
 - Existing App Runner capacity usually covers the new tools, but crawling/PageSpeed can increase CPU time, duration, logs and request charges.
 - GA4 Data/Admin APIs are quota-controlled; avoid high-frequency bulk reports.
 - PageSpeed Insights API has quota limits; use a restricted key and start with low daily usage.
+- An unauthenticated PageSpeed test on 2026-10-12 returned quota_limit_value=0 for consumer project 583797351490. The operator's Cloud Console project has a separate 25,000/day quota; do not describe this as that project's exhausted allowance. Use an explicitly authorized PageSpeed-only key and verify the actual result.
 - CrUX API needs enablement and an API key and only returns field data for eligible origins/pages.
 - Perplexity/Brave/Google Places can incur separate charges or require an account; keep those unset for this deployment.
 - Set AWS budget notifications and CloudWatch log retention; budgets are NOT hard spending caps.

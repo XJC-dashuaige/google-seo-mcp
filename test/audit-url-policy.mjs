@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { assertSafeAuditUrl } from "../dist/tools/audit-url-policy.js";
 import { fetchWithTimeout } from "../dist/tools/web.js";
+// The existing App Runner CI invokes this file on Node 22.
+import "./unit/audit-dns.test.mjs";
 
 for (const safe of [
   "https://cjrb.net/products/test",
