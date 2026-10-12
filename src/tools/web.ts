@@ -506,6 +506,7 @@ export function registerWebTools(server: McpServer) {
       const stop = heartbeat(extra, "waiting for PageSpeed Insights");
       try {
       const run = async (strategy: "mobile" | "desktop") => {
+        assertSafeAuditUrl(a.url);
         const params = new URLSearchParams({ url: a.url, strategy });
         for (const c of a.categories) params.append("category", c);
         if (a.locale) params.set("locale", a.locale);
