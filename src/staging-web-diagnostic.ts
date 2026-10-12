@@ -9,7 +9,10 @@ import { createServer } from "./server.js";
 
 type ToolResult = { isError?: boolean; content?: Array<{ type: string; text?: string }> };
 function summary(result: ToolResult, tool: string) {
-  if (result.isError) return { check: tool, ok: false, type: "tool_error" };
+  if (result.isError) {
+    const message = result.content?.find(c => c.type === "text")?.text ?? "";
+    return { check: tool, ok: false, type: "tool_error", detail: message.slice(0, 220).replace(/[A-Za-z0-9_/-]{32,}/g, "[redacted]") };
+  }
   const raw = result.content?.find(c => c.type === "text")?.text ?? "";
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
