@@ -515,7 +515,13 @@ export function registerWebTools(server: McpServer) {
         const fetchOnce = async () => {
           const res = await fetchWithTimeout(`https://www.googleapis.com/pagespeedonline/v5/runPagespeed?${params}`, {}, 150_000);
           const data = (await res.json()) as PsiResponse;
-          if (!res.ok || data.error) throw new Error(`PageSpeed API: ${data.error?.message ?? `HTTP ${res.status}`}`);
+          if (!res.ok || data.error) {
+            const message = String(data.error?.message ?? `HTTP ${res.status}`);
+            if (/quota exceeded|queries per day|rate limit exceeded|resource exhausted/i.test(message)) {
+              throw new Error("PageSpeed API quota exhausted. No automatic retry. Wait for the quota reset or configure an authorized PAGESPEED_API_KEY with sufficient quota.");
+            }
+            throw new Error(`PageSpeed API: ${message}`);
+          }
           return data;
         };
         let data: PsiResponse;
