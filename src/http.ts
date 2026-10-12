@@ -48,10 +48,11 @@ function json(res: http.ServerResponse, status: number, body: unknown) {
   res.end(JSON.stringify(body));
 }
 
-export function startHttp() {
+export async function startHttp() {
   const hosted = loadHosted();
   // Optional OAuth layer (SEO_MCP_OAUTH=1) for clients that cannot send a static bearer token.
   const oauth = loadOAuth();
+  await oauth?.ready();
   // Optional weekly Search Console digest (SEO_MCP_DIGEST_SITES), so a drop reports itself.
   const digest = startDigestSchedule();
   if (!TOKEN && HOST !== "127.0.0.1" && HOST !== "localhost" && HOST !== "::1") {
@@ -84,7 +85,14 @@ export function startHttp() {
     // access (the browser form asked for that very token), narrowed to read-only for `mcp:read`;
     // a hosted user token → read-only server on that user's own Google grant.
     const operator = authorized(req);
-    const grant = operator ? null : oauth?.resolve(bearer(req)) ?? null;
+    let grant = null;
+    try {
+      grant = operator ? null : oauth ? await oauth.resolve(bearer(req)) : null;
+    } catch (err) {
+      console.error("OAuth store unavailable:", (err as Error).name);
+      json(res, 503, { error: "temporarily_unavailable" });
+      return;
+    }
     const tenant = operator || grant ? null : hosted?.resolve(bearer(req)) ?? null;
     if (!operator && !grant && !tenant) {
       // RFC 9728: point unauthenticated clients at the metadata so they can start the OAuth flow.

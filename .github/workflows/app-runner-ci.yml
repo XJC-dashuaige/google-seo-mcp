@@ -5,6 +5,9 @@ on:
     paths:
       - "apprunner.yaml"
       - "src/**"
+      - "test/app-runner-readonly-expansion.mjs"
+      - "test/oauth-dynamo-unit.mjs"
+      - "test/audit-url-policy.mjs"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/app-runner-ci.yml"
@@ -31,3 +34,9 @@ jobs:
         run: npm run build
       - name: Verify compiled MCP entrypoint
         run: test -f dist/index.js
+      - name: Verify expanded read-only toolset (offline)
+        run: node test/app-runner-readonly-expansion.mjs
+      - name: Verify DynamoDB OAuth durable store (mocked AWS)
+        run: node test/oauth-dynamo-unit.mjs
+      - name: Validate audit URL policy and redirect protection
+        run: node test/audit-url-policy.mjs

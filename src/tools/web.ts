@@ -4,6 +4,8 @@
  */
 import { gunzipSync } from "node:zlib";
 import { envValue } from "../env.js";
+import { assertSafeAuditUrl } from "./audit-url-policy.js";
+import { auditDispatcher } from "./audit-dns.js";
 import { z } from "zod";
 import * as cheerio from "cheerio";
 import { imageSize, disableTypes } from "image-size";
@@ -20,7 +22,29 @@ export async function fetchWithTimeout(url: string, init: RequestInit = {}, time
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal, headers: { "User-Agent": UA, Accept: "*/*", ...(init.headers ?? {}) } });
+    let current = url;
+    const redirect = init.redirect ?? "follow";
+    for (let hop = 0; hop <= 6; hop++) {
+      assertSafeAuditUrl(current);
+      const response = await fetch(current, {
+        ...init, dispatcher: auditDispatcher, redirect: "manual", signal: ctrl.signal,
+        headers: { "User-Agent": UA, Accept: "*/*", ...(init.headers ?? {}) },
+      } as RequestInit);
+      if (redirect !== "follow" || response.status < 300 || response.status >= 400) return response;
+      const location = response.headers.get("location");
+      if (!location) return response;
+      const next = new URL(location, current).toString();
+      assertSafeAuditUrl(next);
+      // Do not forward application tokens to a redirected third-party host.
+      if (new URL(next).origin !== new URL(current).origin) {
+        const headers = new Headers(init.headers);
+        if (headers.has("authorization") || headers.has("x-goog-api-key") || headers.has("x-subscription-token")) {
+          throw new Error("Authenticated cross-origin redirect blocked");
+        }
+      }
+      current = next;
+    }
+    throw new Error("Too many redirects");
   } finally {
     clearTimeout(t);
   }
@@ -483,6 +507,7 @@ export function registerWebTools(server: McpServer) {
       const stop = heartbeat(extra, "waiting for PageSpeed Insights");
       try {
       const run = async (strategy: "mobile" | "desktop") => {
+        assertSafeAuditUrl(a.url);
         const params = new URLSearchParams({ url: a.url, strategy });
         for (const c of a.categories) params.append("category", c);
         if (a.locale) params.set("locale", a.locale);
@@ -491,7 +516,13 @@ export function registerWebTools(server: McpServer) {
         const fetchOnce = async () => {
           const res = await fetchWithTimeout(`https://www.googleapis.com/pagespeedonline/v5/runPagespeed?${params}`, {}, 150_000);
           const data = (await res.json()) as PsiResponse;
-          if (!res.ok || data.error) throw new Error(`PageSpeed API: ${data.error?.message ?? `HTTP ${res.status}`}`);
+          if (!res.ok || data.error) {
+            const message = String(data.error?.message ?? `HTTP ${res.status}`);
+            if (/quota exceeded|queries per day|rate limit exceeded|resource exhausted/i.test(message)) {
+              throw new Error("PageSpeed API quota exhausted. No automatic retry. Wait for the quota reset or configure an authorized PAGESPEED_API_KEY with sufficient quota.");
+            }
+            throw new Error(`PageSpeed API: ${message}`);
+          }
           return data;
         };
         let data: PsiResponse;

@@ -210,7 +210,7 @@ export function createServer(overrides: ServerOptions = {}): McpServer {
       },
     },
     tool(async (a: { includeRevoked: boolean }) => {
-      const grants = requireOAuth().store.listGrants(a.includeRevoked);
+      const grants = await requireOAuth().store.listGrants(a.includeRevoked);
       return {
         grants,
         live: grants.filter((g) => !g.revokedAt && !g.refreshExpired).length,
@@ -231,11 +231,11 @@ export function createServer(overrides: ServerOptions = {}): McpServer {
     },
     tool(async (a: { id: string; dryRun: boolean }) => {
       const store = requireOAuth().store;
-      const grant = store.listGrants(true).find((g) => g.id === a.id);
+      const grant = (await store.listGrants(true)).find((g) => g.id === a.id);
       if (!grant) throw new Error(`No grant with id '${a.id}'. Run oauth_list_grants to see the current ids.`);
       if (grant.revokedAt) return { ...grant, action: "already revoked" };
       if (a.dryRun) return { ...grant, action: "would revoke", dryRun: true };
-      store.revokeGrant(a.id);
+      await store.revokeGrant(a.id);
       console.error(JSON.stringify({ oauth: "revoked", at: new Date().toISOString(), grant: a.id, by: "oauth_revoke_grant" }));
       return { ...grant, action: "revoked", revokedAt: new Date().toISOString() };
     }),
