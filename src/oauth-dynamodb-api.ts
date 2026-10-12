@@ -94,7 +94,10 @@ export class DynamoApi {
     if (!response.ok) {
       const type = String(output.__type ?? "DynamoDbError").split("#").pop();
       // Do not echo service payloads; unexpected server errors can include identifiers.
-      const e = new Error(type);
+      const staging = envValue("SEO_MCP_STAGING_DIAGNOSTIC") === "1";
+      const raw = String(output.message ?? output.Message ?? "");
+      const detail = staging ? raw.slice(0, 240).replace(/[A-Za-z0-9_/-]{32,}/g, "[redacted]") : "";
+      const e = new Error(detail ? type + ": " + detail : type);
       e.name = type ?? "DynamoDbError";
       throw e;
     }
