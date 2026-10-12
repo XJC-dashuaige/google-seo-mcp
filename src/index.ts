@@ -14,6 +14,9 @@ if (mode === "http") {
     void import("./staging-google-diagnostic.js")
       .then(m => m.verifyStagingGoogleAccess())
       .catch(e => console.error(JSON.stringify({ check: "STAGING_DIAGNOSTIC", ok: false, errorType: (e as Error).name })));
+    void import("./staging-oauth-diagnostic.js")
+      .then(m => m.verifyStagingOAuth())
+      .catch(e => console.error(JSON.stringify({ check: "OAUTH_DYNAMO_STAGING", ok: false, errorType: (e as Error).name })));
   }
 } else {
   const server = createServer();
