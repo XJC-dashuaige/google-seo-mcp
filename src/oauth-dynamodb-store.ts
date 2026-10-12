@@ -125,7 +125,8 @@ export class DynamoOAuthStore {
       await this.api.transaction([
         { Update: {
           TableName: this.table, Key: this.api.key("grant#" + grant.id),
-          UpdateExpression: "SET body = :body, ttl = :ttl, refreshHash = :new",
+          UpdateExpression: "SET #body = :body, #ttl = :ttl, #refreshHash = :new",
+          ExpressionAttributeNames: { "#body": "body", "#ttl": "ttl", "#refreshHash": "refreshHash" },
           ConditionExpression: "(attribute_not_exists(refreshHash) OR refreshHash = :old) AND attribute_not_exists(revokedAt)",
           ExpressionAttributeValues: {
             ":body": body(updated), ":ttl": dynamoNumber(updated.refreshExp),
