@@ -14,7 +14,7 @@ export function assertSafeAuditUrl(input: string): void {
   if (!host || host === "localhost" || host.endsWith(".localhost") ||
       host.endsWith(".local") || host.endsWith(".internal") ||
       host.endsWith(".test") || host.endsWith(".invalid") ||
-      host.endsWith(".onion") || isIP(host)) throw new Error("Internal or numeric IP audit targets are not allowed");
+      host.endsWith(".onion") || host.includes(":") || isIP(host)) throw new Error("Internal or numeric IP audit targets are not allowed");
   if (url.port && !["80","443"].includes(url.port)) throw new Error("Nonstandard URL port is not allowed");
   const configured = envValue("SEO_MCP_AUDIT_ALLOWED_HOSTS");
   if (configured) {
