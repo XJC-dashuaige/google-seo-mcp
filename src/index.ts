@@ -9,7 +9,7 @@ const mode = process.argv.includes("--http") || process.env.MCP_TRANSPORT === "h
 
 if (mode === "http") {
   const { startHttp } = await import("./http.js");
-  startHttp();
+  await startHttp();
   if (process.env.SEO_MCP_STAGING_DIAGNOSTIC === "1") {
     void import("./staging-google-diagnostic.js")
       .then(m => m.verifyStagingGoogleAccess())

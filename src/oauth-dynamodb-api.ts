@@ -99,6 +99,9 @@ export class DynamoApi {
       const detail = staging ? raw.slice(0, 240).replace(/[A-Za-z0-9_/-]{32,}/g, "[redacted]") : "";
       const e = new Error(detail ? type + ": " + detail : type);
       e.name = type ?? "DynamoDbError";
+      // Retain only reason codes; payload messages and item data remain private.
+      const reasons=Array.isArray(output.CancellationReasons)?output.CancellationReasons:[];
+      (e as Error & {cancellationCodes:string[]}).cancellationCodes=reasons.map(x=>String((x as Json).Code??''));
       throw e;
     }
     return output;
@@ -122,7 +125,14 @@ export class DynamoApi {
     return (r.Attributes as Json | undefined) ?? null;
   }
   async transaction(actions: Json[]): Promise<void> {
-    await this.call("TransactWriteItems", { TransactItems: actions });
+    for(let attempt=0;attempt<3;attempt++){
+      try { await this.call("TransactWriteItems", { TransactItems: actions }); return; }
+      catch(error){
+        const codes=(error as Error & {cancellationCodes?:string[]}).cancellationCodes??[];
+        if((error as Error).name!=='TransactionCanceledException'||!codes.includes('TransactionConflict')||codes.includes('ConditionalCheckFailed')||attempt===2)throw error;
+        await new Promise(resolve=>setTimeout(resolve,25*2**attempt+Math.floor(Math.random()*25)));
+      }
+    }
   }
   async scan(prefix: string): Promise<Json[]> {
     const out: Json[] = [];
@@ -130,6 +140,7 @@ export class DynamoApi {
     do {
       const r = await this.call("Scan", {
         TableName: this.table,
+        ConsistentRead: true,
         FilterExpression: "begins_with(pk, :prefix)",
         ExpressionAttributeValues: { ":prefix": dynamoString(prefix) },
         ...(last ? { ExclusiveStartKey: last } : {}),

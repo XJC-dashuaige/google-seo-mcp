@@ -7,6 +7,7 @@
 import { randomBytes } from "node:crypto";
 import { DynamoApi, dynamoString, dynamoNumber } from "./oauth-dynamodb-api.js";
 import { hashToken } from "./hosted/store.js";
+import { envValue } from './env.js';
 
 const ACCESS_TTL = 86_400;
 const REFRESH_TTL = 90 * 86_400;
@@ -31,24 +32,67 @@ const remove = (table: string, pk: string) => ({ Delete: { TableName: table, Key
 
 export class DynamoOAuthStore {
   private api: DynamoApi;
+  private registrationReady?: Promise<void>;
+  private maintenanceTimer?: ReturnType<typeof setInterval>;
   constructor(table: string, region: string) { this.api = new DynamoApi(table, region); }
   private get table() { return this.api.table; }
-  close() {}
+  close() { if(this.maintenanceTimer)clearInterval(this.maintenanceTimer); }
+  /** One-time migration while the old service is paused. Call before listening.
+   * Later starts read one metadata item, never scan from anonymous requests. */
+  prepareRegistration(): Promise<void> {
+    return this.registrationReady ??= (async () => {
+      if (await this.api.get('meta#client-count')) return;
+      if (envValue('SEO_MCP_OAUTH_INIT_CLIENT_COUNTER') !== '1') throw new Error('OAuth client counter must be initialized offline while legacy writers are paused');
+      const count = (await this.api.scan('client#')).length;
+      try { await this.api.put('meta#client-count', { n: dynamoNumber(count) }, 'attribute_not_exists(pk)'); }
+      catch (error) { if ((error as Error).name !== 'ConditionalCheckFailedException') throw error; }
+    })();
+  }
+  async startMaintenance(): Promise<void> {
+    await this.prepareRegistration();
+    await this.pruneClients();
+    if (!this.maintenanceTimer) {
+      this.maintenanceTimer=setInterval(()=>{ void this.pruneClients().catch(()=>console.error(JSON.stringify({oauth:'client_cleanup',ok:false}))); },3600000);
+      this.maintenanceTimer.unref();
+    }
+  }
   async registerClient(name: string | null, redirectUris: string[]): Promise<Client> {
+    await this.prepareRegistration();
     const client: Client = { clientId: randomBytes(16).toString("hex"), name, redirectUris, createdAt: stamp(), lastUsedAt: null };
     // Clients must not expire while a refresh grant is active; clean stale
     // registrations explicitly instead of using a TTL on approved clients.
-    await this.api.put("client#" + client.clientId, { body: body(client) }, "attribute_not_exists(pk)");
+    try {
+      await this.api.transaction([
+        { Update: { TableName: this.table, Key: this.api.key('meta#client-count'),
+          UpdateExpression: 'ADD #n :one', ConditionExpression: 'attribute_exists(pk) AND #n < :max',
+          ExpressionAttributeNames: { '#n':'n' }, ExpressionAttributeValues: { ':one':dynamoNumber(1), ':max':dynamoNumber(500) } } },
+        { Update: { TableName: this.table, Key: this.api.key('registration-minute#' + Math.floor(epoch()/60)),
+          UpdateExpression: 'SET #ttl = :ttl ADD #n :one', ConditionExpression: 'attribute_not_exists(#n) OR #n < :budget',
+          ExpressionAttributeNames: { '#n':'n', '#ttl':'ttl' },
+          ExpressionAttributeValues: { ':one':dynamoNumber(1), ':budget':dynamoNumber(20), ':ttl':dynamoNumber(epoch()+3600) } } },
+        { Put: { TableName: this.table, Item: { pk:dynamoString('client#'+client.clientId), body:body(client) }, ConditionExpression:'attribute_not_exists(pk)' } },
+      ]);
+    } catch(error) {
+      if ((error as Error).name === 'TransactionCanceledException') {
+        const unavailable = new Error('Registration capacity or minute budget reached');
+        unavailable.name = 'RegistrationUnavailableError'; throw unavailable;
+      }
+      throw error;
+    }
     return client;
   }
   async getClient(clientId: string): Promise<Client | null> {
     return decode<Client>(await this.api.get("client#" + clientId));
   }
-  async countClients(): Promise<number> { return (await this.api.scan("client#")).length; }
+  async countClients(): Promise<number> { await this.prepareRegistration(); const row=await this.api.get('meta#client-count'); return Number((row?.n as {N:string}|undefined)?.N ?? 0); }
   async countGrants(): Promise<number> {
     return (await this.api.scan("grant#")).filter(x => { const g = decode<Grant>(x); return g && !x.revokedAt && g.refreshExp > epoch(); }).length;
   }
   async pruneClients(): Promise<number> {
+    await this.prepareRegistration();
+    // At most one cleanup scan per hour across all instances, off the public path.
+    try { await this.api.put('maintenance#clients#'+Math.floor(epoch()/3600),{ttl:dynamoNumber(epoch()+7200)},'attribute_not_exists(pk)'); }
+    catch(error) { if((error as Error).name==='ConditionalCheckFailedException')return 0; throw error; }
     const clients = await this.api.scan("client#");
     const grants = (await this.api.scan("grant#")).map(x => decode<Grant>(x)).filter((x): x is Grant => !!x);
     const active = new Set(grants.map(x => x.clientId));
@@ -57,7 +101,14 @@ export class DynamoOAuthStore {
     for (const item of clients) {
       const client = decode<Client>(item);
       if (client && !active.has(client.clientId) && Date.parse(client.createdAt) < cutoff) {
-        await this.api.delete("client#" + client.clientId); n++;
+        try {
+          await this.api.transaction([
+            { Delete: { TableName:this.table, Key:this.api.key('client#'+client.clientId), ConditionExpression:'attribute_exists(pk) AND (attribute_not_exists(approvedUntil) OR approvedUntil < :now)', ExpressionAttributeValues:{':now':dynamoNumber(epoch())} } },
+            { Update: { TableName:this.table, Key:this.api.key('meta#client-count'), UpdateExpression:'ADD #n :one',
+              ConditionExpression:'#n > :zero', ExpressionAttributeNames:{'#n':'n'},
+              ExpressionAttributeValues:{':one':dynamoNumber(-1),':zero':dynamoNumber(0)} } },
+          ]); n++;
+        } catch(error) { if ((error as Error).name !== 'TransactionCanceledException') throw error; }
       }
     }
     return n;
@@ -78,6 +129,7 @@ export class DynamoOAuthStore {
       prevRefreshHash: null, createdAt: stamp(), lastUsedAt: null, calls: 0, revokedAt: null,
     };
     await this.api.transaction([
+      { Update: { TableName:this.table, Key:this.api.key('client#'+clientId), UpdateExpression:'SET approvedUntil = :until', ConditionExpression:'attribute_exists(pk)', ExpressionAttributeValues:{':until':dynamoNumber(grant.refreshExp)} } },
       { Put: { TableName: this.table, Item: { pk: dynamoString("grant#" + grant.id), body: body(grant), ttl: dynamoNumber(grant.refreshExp), refreshHash: dynamoString(grant.refreshHash) }, ConditionExpression: "attribute_not_exists(pk)" } },
       put(this.table, "access#" + grant.accessHash, { grantId: grant.id }, grant.accessExp),
       put(this.table, "refresh#" + grant.refreshHash, { grantId: grant.id }, grant.refreshExp),
@@ -123,6 +175,7 @@ export class DynamoOAuthStore {
     // two concurrent refresh requests can never both rotate the same token.
     try {
       await this.api.transaction([
+        { Update: { TableName:this.table, Key:this.api.key('client#'+grant.clientId), UpdateExpression:'SET approvedUntil = :until', ConditionExpression:'attribute_exists(pk)', ExpressionAttributeValues:{':until':dynamoNumber(updated.refreshExp)} } },
         { Update: {
           TableName: this.table, Key: this.api.key("grant#" + grant.id),
           UpdateExpression: "SET #body = :body, #ttl = :ttl, #refreshHash = :new",
@@ -143,7 +196,9 @@ export class DynamoOAuthStore {
       // If another instance has already rotated, treat this as a replay.
       if ((error as Error).name === "TransactionCanceledException") {
         const spent = await this.api.get("spent#" + hash);
-        if (spent) await this.revokeGrant(grant.id);
+        if (spent) { await this.revokeGrant(grant.id); return null; }
+        const codes=(error as Error & {cancellationCodes?:string[]}).cancellationCodes??[];
+        if(codes.includes('TransactionConflict'))throw error;
         return null;
       }
       throw error;

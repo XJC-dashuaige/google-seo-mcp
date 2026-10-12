@@ -4,11 +4,13 @@
  * replay revocation, and one-time authorization-code consumption.
  */
 import assert from "node:assert/strict";
+import './oauth-registration-unit.mjs';
 import { createHash } from "node:crypto";
 import { DynamoOAuthStore } from "../dist/oauth-dynamodb-store.js";
 process.env.AWS_ACCESS_KEY_ID = "test-access";
 process.env.AWS_SECRET_ACCESS_KEY = "test-secret";
 process.env.AWS_REGION = "us-east-1";
+process.env.SEO_MCP_OAUTH_INIT_CLIENT_COUNTER='1';
 const items = new Map();
 const copy = (x) => structuredClone(x);
 const error = (name) => Object.assign(new Error(name), { name });
@@ -16,6 +18,11 @@ const key = (obj) => obj.pk.S;
 const check = (statement, old, values) => {
   if (!statement) return true;
   if (statement === "attribute_not_exists(pk)") return !old;
+  if (statement === 'attribute_exists(pk) AND #n < :max') return !!old && Number(old.n.N)<Number(values[':max'].N);
+  if (statement === 'attribute_not_exists(#n) OR #n < :budget') return !old?.n || Number(old.n.N)<Number(values[':budget'].N);
+  if (statement === '#n > :zero') return Number(old?.n?.N??0)>0;
+  if (statement === 'attribute_exists(pk)') return !!old;
+  if (statement.includes('attribute_not_exists(approvedUntil)')) return !!old && (!old.approvedUntil || Number(old.approvedUntil.N)<Number(values[':now'].N));
   if (statement === "attribute_exists(pk) AND attribute_not_exists(revokedAt)") return !!old && !old.revokedAt;
   if (statement.includes("refreshHash")) {
     return !old?.revokedAt && (!old.refreshHash || old.refreshHash.S === values[":old"].S);
@@ -31,6 +38,7 @@ function exec(op, args, state) {
   }
   if (op === "DeleteItem") {
     const pk = key(args.Key), old = state.get(pk);
+    if (!check(args.ConditionExpression,old,args.ExpressionAttributeValues??{})) throw error('ConditionalCheckFailedException');
     state.delete(pk);
     return { ...(args.ReturnValues === "ALL_OLD" && old ? { Attributes: old } : {}) };
   }
@@ -41,9 +49,11 @@ function exec(op, args, state) {
   if (op === "UpdateItem") {
     const pk = key(args.Key), old = state.get(pk);
     if (!check(args.ConditionExpression, old, args.ExpressionAttributeValues ?? {})) throw error("ConditionalCheckFailedException");
-    const next = copy(old);
+    const next = old ? copy(old) : {pk:copy(args.Key.pk)};
     const v = args.ExpressionAttributeValues;
-    if (args.UpdateExpression === "SET revokedAt = :at") next.revokedAt = copy(v[":at"]);
+    if (args.UpdateExpression.includes('ADD #n :one')) { next.n={N:String(Number(old?.n?.N??0)+Number(v[':one'].N))}; if(v[':ttl'])next.ttl=copy(v[':ttl']); }
+    else if (args.UpdateExpression === 'SET approvedUntil = :until') next.approvedUntil=copy(v[':until']);
+    else if (args.UpdateExpression === "SET revokedAt = :at") next.revokedAt = copy(v[":at"]);
     else if (args.UpdateExpression.includes("refreshHash = :new")) {
       next.body = copy(v[":body"]); next.ttl = copy(v[":ttl"]); next.refreshHash = copy(v[":new"]);
     } else throw Error("Unsupported update expression");
@@ -63,10 +73,14 @@ function exec(op, args, state) {
   throw new Error("Unexpected DynamoDB operation: " + op);
 }
 const originalFetch = globalThis.fetch;
+let simulateConflict=false;
 globalThis.fetch = async (_url, options) => {
   const operation = options.headers["x-amz-target"].split(".")[1];
   assert.match(options.headers.authorization, /^AWS4-HMAC-SHA256 Credential=test-access\//);
   let status = 200, output;
+  if(simulateConflict && operation==='TransactWriteItems'){
+    simulateConflict=false; return new Response(JSON.stringify({__type:'TransactionCanceledException',CancellationReasons:[{Code:'TransactionConflict'}]}),{status:400});
+  }
   try { output = exec(operation, JSON.parse(options.body), items); }
   catch (e) { status = 400; output = { __type: e.name }; }
   return new Response(JSON.stringify(output), { status, headers: { "content-type": "application/json" } });
@@ -104,5 +118,10 @@ try {
   const another = await first.issue(client.clientId, "mcp:read");
   assert.equal(await second.revoke(another.access), true);
   assert.equal(await first.resolveAccess(another.access), null);
+  const independent1=await first.issue(client.clientId,'mcp:read');
+  const independent2=await first.issue(client.clientId,'mcp:read');
+  simulateConflict=true;
+  const independentResults=await Promise.all([first.rotate(independent1.refresh,client.clientId),second.rotate(independent2.refresh,client.clientId)]);
+  assert(independentResults.every(Boolean),'independent grant refreshes survive a transient shared-client transaction conflict');
   console.log("DynamoDB OAuth store tests passed (offline)");
 } finally { globalThis.fetch = originalFetch; }

@@ -244,6 +244,7 @@ export class OAuthStore {
 export interface OAuthGrantContext { label: string; readOnly: boolean; scope: string; clientId: string }
 
 export interface OAuthServer {
+  ready(): Promise<void>;
   store: OAuthStore | DynamoOAuthStore;
   /** Handle the metadata, registration, authorize, token and revoke routes; false when the path is not ours. */
   handle(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<boolean>;
@@ -274,6 +275,7 @@ export function loadOAuth(): OAuthServer | null {
   // Approval requests are signed so a POST can only carry parameters from a page we rendered.
   const key = deriveKey(`${envValue("SEO_MCP_HOSTED_SECRET") ?? operatorToken}|oauth-approval`);
   const codes = new Map<string, Pending>();
+  let registrationMinute = -1, registrationAttempts = 0;
   const fails = new Map<string, { n: number; until: number }>();
 
   const prPaths = new Set(["/.well-known/oauth-protected-resource", `/.well-known/oauth-protected-resource${mcpPath}`]);
@@ -344,17 +346,25 @@ export function loadOAuth(): OAuthServer | null {
     // identifier only; nothing can be obtained with it until a human approves with the operator token.
     if (p === "/oauth/register") {
       if (m !== "POST") { jsonOut(res, 405, { error: "invalid_request", error_description: "POST a client registration document" }); return true; }
+      const minute = Math.floor(Date.now()/60000);
+      if (minute !== registrationMinute) { registrationMinute = minute; registrationAttempts = 0; }
+      if (++registrationAttempts > 20) { res.setHeader('Retry-After','60'); jsonOut(res,429,{error:'temporarily_unavailable',error_description:'registration rate limit reached; retry later'}); return true; }
       let body: Record<string, unknown>;
       try { body = JSON.parse(await readBody(req)) as Record<string, unknown>; } catch { jsonOut(res, 400, { error: "invalid_client_metadata", error_description: "body must be JSON of at most 16 KB" }); return true; }
       const uris = Array.isArray(body.redirect_uris) ? (body.redirect_uris as unknown[]).map(String) : [];
       if (!uris.length || uris.length > MAX_REDIRECT_URIS) { jsonOut(res, 400, { error: "invalid_redirect_uri", error_description: `redirect_uris must hold 1 to ${MAX_REDIRECT_URIS} entries` }); return true; }
       const bad = uris.filter((u) => !validRedirectUri(u));
       if (bad.length) { jsonOut(res, 400, { error: "invalid_redirect_uri", error_description: `not accepted: ${bad.join(", ")} (https, http on loopback, or a private-use scheme)` }); return true; }
-      await store.pruneClients();
+      if (!(store instanceof DynamoOAuthStore)) await store.pruneClients();
       // Registration needs no credentials by design, so keep it from filling the disk.
-      if (await store.countClients() >= MAX_CLIENTS) { jsonOut(res, 503, { error: "temporarily_unavailable", error_description: "too many client registrations on this server; try again later" }); return true; }
+      if (!(store instanceof DynamoOAuthStore) && await store.countClients() >= MAX_CLIENTS) { jsonOut(res, 503, { error: "temporarily_unavailable", error_description: "too many client registrations on this server; try again later" }); return true; }
       const name = typeof body.client_name === "string" ? body.client_name.slice(0, 80) : null;
-      const c = await store.registerClient(name, uris);
+      let c: OAuthClient;
+      try { c = await store.registerClient(name, uris); }
+      catch(error) {
+        if ((error as Error).name !== 'RegistrationUnavailableError') throw error;
+        res.setHeader('Retry-After','60'); jsonOut(res,503,{error:'temporarily_unavailable',error_description:'registration capacity or rate limit reached; retry later'}); return true;
+      }
       console.error(JSON.stringify({ oauth: "register", at: new Date().toISOString(), client: c.clientId, name: c.name, redirectUris: uris }));
       jsonOut(res, 201, {
         client_id: c.clientId,
@@ -464,6 +474,7 @@ export function loadOAuth(): OAuthServer | null {
 
   LOADED = {
     store,
+    ready: async () => { if (store instanceof DynamoOAuthStore) await store.startMaintenance(); },
     handle,
     async resolve(bearer) {
       if (!bearer.startsWith(ACCESS_PREFIX)) return null;

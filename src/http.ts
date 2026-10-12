@@ -48,10 +48,11 @@ function json(res: http.ServerResponse, status: number, body: unknown) {
   res.end(JSON.stringify(body));
 }
 
-export function startHttp() {
+export async function startHttp() {
   const hosted = loadHosted();
   // Optional OAuth layer (SEO_MCP_OAUTH=1) for clients that cannot send a static bearer token.
   const oauth = loadOAuth();
+  await oauth?.ready();
   // Optional weekly Search Console digest (SEO_MCP_DIGEST_SITES), so a drop reports itself.
   const digest = startDigestSchedule();
   if (!TOKEN && HOST !== "127.0.0.1" && HOST !== "localhost" && HOST !== "::1") {
