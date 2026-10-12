@@ -89,6 +89,18 @@ try {
   assert.ok(await first.resolveAccess(rotated.access));
   assert.equal(await first.rotate(issued.refresh, client.clientId), null, "spent refresh rejected");
   assert.equal(await second.resolveAccess(rotated.access), null, "replayed refresh revokes grant");
+  // Cross-instance concurrent refresh: only one atomic rotation may win.
+  // A losing duplicate is treated as a replay, revoking that grant.
+  const race = await first.issue(client.clientId, "mcp:read");
+  const pair = await Promise.all([
+    first.rotate(race.refresh, client.clientId),
+    second.rotate(race.refresh, client.clientId),
+  ]);
+  assert.equal(pair.filter(Boolean).length, 1, "only one concurrent refresh wins");
+  const winner = pair.find(Boolean);
+  assert.equal(await first.resolveAccess(winner.access), null,
+    "a duplicate refresh revokes the grant as replay");
+
   const another = await first.issue(client.clientId, "mcp:read");
   assert.equal(await second.revoke(another.access), true);
   assert.equal(await first.resolveAccess(another.access), null);
