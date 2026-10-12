@@ -7,7 +7,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { DynamoOAuthStore } from "./oauth-dynamodb-store.js";
 
 function fail(check: string, error: unknown) {
-  console.error(JSON.stringify({ check, ok: false, errorType: (error as Error)?.name ?? "Error" }));
+  console.error(JSON.stringify({ check, ok: false, errorType: (error as Error)?.name ?? "Error", detail: String((error as Error)?.message ?? "").slice(0,240) }));
 }
 export async function verifyStagingOAuth(): Promise<void> {
   const table = process.env.SEO_MCP_DYNAMODB_TABLE;
