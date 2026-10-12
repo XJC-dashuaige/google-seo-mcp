@@ -17,7 +17,9 @@ export async function verifyStagingOAuth(): Promise<void> {
   const tag = randomBytes(12).toString("hex");
   let grantId: string | undefined;
   let concurrentGrantId: string | undefined;
+  let phase = "init";
   try {
+    phase = "CLIENT_REGISTER";
     const client = await a.registerClient("staging-diagnostic-" + tag, ["https://example.org/oauth-callback"]);
     const loaded = await b.getClient(client.clientId);
     if (!loaded || loaded.clientId !== client.clientId) throw new Error("ClientReadBackFailed");
@@ -25,6 +27,7 @@ export async function verifyStagingOAuth(): Promise<void> {
 
     const code = createHash("sha256").update("diagnostic-" + tag).digest("hex");
     const pending = { clientId: client.clientId, redirectUri: client.redirectUris[0], challenge: tag, scope: "mcp:read", exp: Date.now() + 120000 };
+    phase = "SAVE_CODE";
     await a.saveCode(code, pending);
     const consumed = await b.consumeCode(code);
     if (consumed?.clientId !== client.clientId || await a.consumeCode(code) !== null) {
@@ -32,21 +35,27 @@ export async function verifyStagingOAuth(): Promise<void> {
     }
     console.error(JSON.stringify({ check: "OAUTH_DYNAMO_ONE_TIME_CODE", ok: true }));
 
+    phase = "GRANT_ISSUE";
     const grant = await a.issue(client.clientId, "mcp:read");
     grantId = grant.grantId;
+    phase = "ACCESS_RESOLVE";
     if ((await b.resolveAccess(grant.access))?.scope !== "mcp:read") throw new Error("AccessReadFailed");
+    phase = "ROTATE";
     const rotated = await b.rotate(grant.refresh, client.clientId);
     if (!rotated || await a.resolveAccess(grant.access) !== null || !await a.resolveAccess(rotated.access)) {
       throw new Error("RotationFailed");
     }
     console.error(JSON.stringify({ check: "OAUTH_DYNAMO_ROTATION", ok: true }));
+    phase = "REPLAY";
     if (await a.rotate(grant.refresh, client.clientId) !== null || await b.resolveAccess(rotated.access) !== null) {
       throw new Error("ReplayNotRevoked");
     }
     console.error(JSON.stringify({ check: "OAUTH_DYNAMO_REPLAY_REVOCATION", ok: true }));
 
+    phase = "CONCURRENT_ISSUE";
     const concurrent = await a.issue(client.clientId, "mcp:read");
     concurrentGrantId = concurrent.grantId;
+    phase = "CONCURRENT_ROTATE";
     const attempts = await Promise.all([
       a.rotate(concurrent.refresh, client.clientId),
       b.rotate(concurrent.refresh, client.clientId),
@@ -56,7 +65,7 @@ export async function verifyStagingOAuth(): Promise<void> {
     if (await a.resolveAccess(winner.access) !== null) throw new Error("ReplayNotRevokedAfterRace");
     console.error(JSON.stringify({ check: "OAUTH_DYNAMO_CONCURRENT_REFRESH", ok: true }));
   } catch (error) {
-    fail("OAUTH_DYNAMO_STAGING", error);
+    fail("OAUTH_DYNAMO_STAGING_" + phase, error);
   } finally {
     // Prevent these test grants from remaining usable; client metadata expires
     // through the existing orphan-registration pruning mechanism.
