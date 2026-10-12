@@ -4,6 +4,7 @@
  */
 import { gunzipSync } from "node:zlib";
 import { envValue } from "../env.js";
+import { assertSafeAuditUrl } from "./audit-url-policy.js";
 import { z } from "zod";
 import * as cheerio from "cheerio";
 import { imageSize, disableTypes } from "image-size";
@@ -20,7 +21,29 @@ export async function fetchWithTimeout(url: string, init: RequestInit = {}, time
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal, headers: { "User-Agent": UA, Accept: "*/*", ...(init.headers ?? {}) } });
+    let current = url;
+    const redirect = init.redirect ?? "follow";
+    for (let hop = 0; hop <= 6; hop++) {
+      assertSafeAuditUrl(current);
+      const response = await fetch(current, {
+        ...init, redirect: "manual", signal: ctrl.signal,
+        headers: { "User-Agent": UA, Accept: "*/*", ...(init.headers ?? {}) },
+      });
+      if (redirect !== "follow" || response.status < 300 || response.status >= 400) return response;
+      const location = response.headers.get("location");
+      if (!location) return response;
+      const next = new URL(location, current).toString();
+      assertSafeAuditUrl(next);
+      // Do not forward application tokens to a redirected third-party host.
+      if (new URL(next).origin !== new URL(current).origin) {
+        const headers = new Headers(init.headers);
+        if (headers.has("authorization") || headers.has("x-goog-api-key") || headers.has("x-subscription-token")) {
+          throw new Error("Authenticated cross-origin redirect blocked");
+        }
+      }
+      current = next;
+    }
+    throw new Error("Too many redirects");
   } finally {
     clearTimeout(t);
   }
